@@ -12,10 +12,10 @@ const ProjectSchema = new mongoose.Schema({
     required: true
   },
 
-  fileKey: {
+  fileKeys: [{
     type: String,
     required: true
-  },
+  }],
   // This connects to Pinecone (The Vector Database)
   // We use the Project ID itself as the namespace usually, 
   // but storing it explicitly is good practice.
