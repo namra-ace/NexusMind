@@ -3,14 +3,14 @@ const { v4: uuidv4 } = require('uuid');
 const Project = require('../models/Project');
 const pinecone = require('../config/pinecone');
 
-// --- 🔧 PDF PARSE FIX 🔧 ---
+// --- 🔧 PDF PARSE V2 FIX 🔧 ---
 const { PDFParse } = require('pdf-parse'); 
 
 // LangChain Imports
 const { RecursiveCharacterTextSplitter } = require('@langchain/textsplitters');
 const { GoogleGenerativeAIEmbeddings } = require('@langchain/google-genai');
 const { PineconeStore } = require('@langchain/pinecone');
-const { TaskType } = require("@google/generative-ai"); // Required for correct embedding generation
+const { TaskType } = require("@google/generative-ai");
 
 // Helper: Download file from Supabase as a Buffer
 const downloadFromSupabase = async (filePath) => {
@@ -63,8 +63,7 @@ exports.createProject = async (req, res) => {
 
     console.log(`🚀 Starting ingestion for project: ${project.name}`);
 
-    // --- 🔧 EMBEDDING MODEL FIX 🔧 ---
-    // We use 'text-embedding-004' which outputs 768 dimensions natively.
+    // --- EMBEDDING MODEL CONFIG ---
     const embeddings = new GoogleGenerativeAIEmbeddings({
       model: "text-embedding-004", 
       taskType: TaskType.RETRIEVAL_DOCUMENT,
@@ -78,7 +77,7 @@ exports.createProject = async (req, res) => {
 
       const buffer = await downloadFromSupabase(fileKey);
       
-      // --- 🔧 PDF PARSING LOGIC 🔧 ---
+      // --- PDF PARSING LOGIC ---
       let rawText = "";
       try {
         const parser = new PDFParse({ data: buffer });
@@ -93,7 +92,7 @@ exports.createProject = async (req, res) => {
         throw new Error("Failed to parse PDF text");
       }
 
-      // 2. Chunk Text
+      // Chunk Text
       const splitter = new RecursiveCharacterTextSplitter({
         chunkSize: 1000,
         chunkOverlap: 200,
@@ -101,7 +100,7 @@ exports.createProject = async (req, res) => {
       const docs = await splitter.createDocuments([rawText]);
       console.log(`File split into ${docs.length} chunks`);
 
-      // 3. Store in Pinecone
+      // Store in Pinecone
       await PineconeStore.fromDocuments(docs, embeddings, {
         pineconeIndex,
         namespace: pineconeNamespace, 
@@ -118,6 +117,18 @@ exports.createProject = async (req, res) => {
 
   } catch (error) {
     console.error("Ingestion Error:", error);
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// --- 👇 THIS WAS MISSING 👇 ---
+// @desc    Get all projects for the logged-in user
+// @route   GET /api/projects
+exports.getAllProjects = async (req, res) => {
+  try {
+    const projects = await Project.find({ userId: req.user.id }).sort({ createdAt: -1 });
+    res.json(projects);
+  } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };

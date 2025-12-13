@@ -18,10 +18,10 @@ app.get('/', (req, res) => {
 
 // --- ROUTES ---
 app.use('/api/auth', require('./routes/authRoutes'));
-app.use('/api/projects', require('./routes/projectRoutes')); // <--- ADD THIS LINE
+// MAKE SURE THIS LINE EXISTS:
+app.use('/api/projects', require('./routes/projectRoutes')); 
+app.use('/api/chat', require('./routes/chatRoutes'));
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
-app.use('/api/chat', require('./routes/chatRoutes'));

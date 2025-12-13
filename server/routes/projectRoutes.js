@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const { getUploadUrl, createProject } = require('../controllers/projectController'); // <--- Import createProject
+// Import all controller functions
+const { getUploadUrl, createProject, getAllProjects } = require('../controllers/projectController'); 
 const { protect } = require('../middleware/authMiddleware');
 
 // @route   POST /api/projects/upload-url
@@ -8,7 +9,11 @@ const { protect } = require('../middleware/authMiddleware');
 router.post('/upload-url', protect, getUploadUrl);
 
 // @route   POST /api/projects
-// @desc    Save project metadata to Mongo
-router.post('/', protect, createProject); 
+// @desc    Save project metadata to Mongo & Ingest
+router.post('/', protect, createProject);
+
+// @route   GET /api/projects
+// @desc    Get all projects for the user
+router.get('/', protect, getAllProjects); 
 
 module.exports = router;
