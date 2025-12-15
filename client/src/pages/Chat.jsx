@@ -5,7 +5,7 @@ import { Send, ArrowLeft, Bot, User, Loader2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 
 const Chat = () => {
-  const { id } = useParams(); // Get Project ID from URL
+  const { id } = useParams();
   const { token, API_URL } = useAuth();
   const navigate = useNavigate();
   
