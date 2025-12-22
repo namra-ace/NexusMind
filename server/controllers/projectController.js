@@ -2,46 +2,35 @@ const supabase = require('../config/supabase');
 const { v4: uuidv4 } = require('uuid');
 const Project = require('../models/Project');
 const pinecone = require('../config/pinecone');
-
-const { PDFParse } = require('pdf-parse');
-
-// LangChain Imports
+const { PDFParse } = require('pdf-parse'); 
 const { RecursiveCharacterTextSplitter } = require('@langchain/textsplitters');
 const { GoogleGenerativeAIEmbeddings } = require('@langchain/google-genai');
 const { PineconeStore } = require('@langchain/pinecone');
 const { TaskType } = require("@google/generative-ai");
+const { GoogleGenAI } = require("@google/genai");
 
-// Helper: Download file from Supabase as a Buffer
+// Helper: Download file from Supabase
 const downloadFromSupabase = async (filePath) => {
   const { data, error } = await supabase.storage
-    .from('nexusmind-uploads')
+    .from('nexusmind-uploads') 
     .download(filePath);
 
-  if (error) {
-    console.error("❌ SUPABASE ERROR:", JSON.stringify(error, null, 2));
-    throw new Error(`Supabase Download Error: ${error.message || 'Unknown Error'}`);
-  }
-
+  if (error) throw new Error(`Supabase Download Error: ${error.message}`);
   return Buffer.from(await data.arrayBuffer());
 };
 
-// @desc    Get a secure upload URL
-// @route   POST /api/projects/upload-url
 exports.getUploadUrl = async (req, res) => {
   try {
     const userId = req.user.id;
     const { fileName } = req.body;
     const uniqueFileName = `${uuidv4()}-${fileName}`;
     const filePath = `users/${userId}/${uniqueFileName}`;
-
     res.json({ filePath, fileName: uniqueFileName });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// @desc    Create Project & Ingest Files (The "Brain" Trigger)
-// @route   POST /api/projects
 exports.createProject = async (req, res) => {
   try {
     const { name, fileKeys } = req.body;
@@ -52,65 +41,140 @@ exports.createProject = async (req, res) => {
     }
 
     const pineconeNamespace = uuidv4();
-
+    
+    // 1. Create Project Entry
     const project = await Project.create({
       name,
       userId,
       fileKeys,
       pineconeNamespace,
+      masterSummary: "Analyzing document... check back in a few minutes.", 
     });
 
-    console.log(`🚀 Starting ingestion for project: ${project.name}`);
-
-    // --- EMBEDDING MODEL CONFIG ---
-    const embeddings = new GoogleGenerativeAIEmbeddings({
-      model: "text-embedding-004",
-      taskType: TaskType.RETRIEVAL_DOCUMENT,
-      apiKey: process.env.GOOGLE_API_KEY
+    res.status(201).json({ 
+      success: true, 
+      project, 
+      message: "Project created! Deep analysis started in background." 
     });
 
-    const pineconeIndex = pinecone.Index("nexusmind");
-
-    for (const fileKey of fileKeys) {
-      console.log(`Processing file: ${fileKey}`);
-
-      const buffer = await downloadFromSupabase(fileKey);
-
-
-      let rawText = "";
+    // ---------------------------------------------------------
+    // 🚀 BACKGROUND PROCESS (Custom Map-Reduce)
+    // ---------------------------------------------------------
+    (async () => {
       try {
-        const parser = new PDFParse({ data: buffer });
-        const pdfData = await parser.getText();
-        rawText = pdfData.text;
+        console.log(`🧠 [Background] Starting Deep Analysis for ${project.name}...`);
 
-        if (parser.destroy) await parser.destroy();
+        const embeddings = new GoogleGenerativeAIEmbeddings({
+          model: "text-embedding-004", 
+          taskType: TaskType.RETRIEVAL_DOCUMENT,
+          apiKey: process.env.GOOGLE_API_KEY
+        });
+        const pineconeIndex = pinecone.Index("nexusmind");
 
-      } catch (parseError) {
-        console.error("❌ PDF Parse Error:", parseError);
-        throw new Error("Failed to parse PDF text");
+        let allTextChunks = [];
+
+        // A. Extract & Embed
+        for (const fileKey of fileKeys) {
+          const buffer = await downloadFromSupabase(fileKey);
+          let rawText = "";
+          
+          try {
+            const parser = new PDFParse({ data: buffer });
+            const pdfData = await parser.getText();
+            rawText = pdfData.text;
+          } catch (e) {
+            console.error("PDF Parse Error:", e);
+            continue;
+          }
+
+          const splitter = new RecursiveCharacterTextSplitter({
+            chunkSize: 1000,
+            chunkOverlap: 200,
+          });
+          const docs = await splitter.createDocuments([rawText]);
+          
+          // Collect text content for summarization
+          docs.forEach(d => allTextChunks.push(d.pageContent));
+
+          // Store vectors
+          await PineconeStore.fromDocuments(docs, embeddings, {
+            pineconeIndex,
+            namespace: pineconeNamespace, 
+          });
+        }
+
+        // B. Custom Map-Reduce Summarization
+        console.log(`🧠 [Background] Summarizing ${allTextChunks.length} chunks...`);
+        
+        // 1. MAP STEP: Summarize chunks in batches
+        const chunkSize = 5; 
+        let sectionSummaries = [];
+        
+        // Initialize New SDK Client
+        const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY });
+
+        for (let i = 0; i < allTextChunks.length; i += chunkSize) {
+          const batch = allTextChunks.slice(i, i + chunkSize).join("\n\n");
+          
+          const prompt = `Summarize these excerpts from a document into a concise paragraph:\n\n${batch}`;
+          
+          try {
+            // ✅ CORRECT SYNTAX FOR NEW SDK
+            const result = await ai.models.generateContent({
+              model: "gemma-3-1b", 
+              contents: [{ role: "user", parts: [{ text: prompt }] }]
+            });
+            
+            // New SDK returns text via .text() method usually
+            const text = result.response.text;
+            sectionSummaries.push(text);
+            process.stdout.write("."); // Progress dot
+          } catch (e) {
+            console.error("Batch error", e.message);
+          }
+        }
+        console.log("\n✅ Section summaries complete.");
+
+        // 2. REDUCE STEP: Create Final Master Summary
+        const finalPrompt = `
+          You are an expert researcher. 
+          Below are summaries of different sections of a document. 
+          Create a detailed "Master Summary" of the entire document based on these notes.
+          
+          NOTES:
+          ${sectionSummaries.join("\n\n")}
+          
+          OUTPUT FORMAT:
+          - Main Theme
+          - Key Concepts (Bullet points)
+          - Conclusion
+        `;
+        
+        // ✅ CORRECT SYNTAX FOR NEW SDK
+        const finalResult = await ai.models.generateContent({
+          model: "gemma-3-1b", 
+          contents: [{ role: "user", parts: [{ text: finalPrompt }] }]
+        });
+
+        const masterSummary = finalResult.response.text;
+
+        // C. Update Database
+        project.masterSummary = masterSummary;
+        await project.save();
+        
+        console.log(`✅ [Background] Analysis Complete for ${project.name}`);
+
+      } catch (bgError) {
+        console.error("❌ [Background] Error:", bgError);
       }
-
-      const splitter = new RecursiveCharacterTextSplitter({
-        chunkSize: 1000,
-        chunkOverlap: 200,
-      });
-      const docs = await splitter.createDocuments([rawText]);
-
-      await PineconeStore.fromDocuments(docs, embeddings, {
-        pineconeIndex,
-        namespace: pineconeNamespace,
-      });
-    }
-
-    res.status(201).json({
-      success: true,
-      project,
-      message: "Project created and documents embedded successfully!"
-    });
+    })();
+    // ---------------------------------------------------------
 
   } catch (error) {
     console.error("Ingestion Error:", error);
-    res.status(500).json({ message: error.message });
+    if (!res.headersSent) {
+      res.status(500).json({ message: error.message });
+    }
   }
 };
 
@@ -123,51 +187,24 @@ exports.getAllProjects = async (req, res) => {
   }
 };
 
-// ... existing imports ...
-
-// @desc    Delete a project (and all associated data)
-// @route   DELETE /api/projects/:id
 exports.deleteProject = async (req, res) => {
   try {
     const userId = req.user.id;
     const projectId = req.params.id;
-
-    // 1. Find the project
     const project = await Project.findOne({ _id: projectId, userId });
-    if (!project) {
-      return res.status(404).json({ message: 'Project not found' });
-    }
+    
+    if (!project) return res.status(404).json({ message: 'Project not found' });
 
-    console.log(`🗑️ Deleting project: ${project.name}`);
-
-    // 2. Delete Vectors from Pinecone (Clean the Brain)
     const pineconeIndex = pinecone.Index("nexusmind");
-    try {
-      // Deletes everything in this specific namespace
-      await pineconeIndex.namespace(project.pineconeNamespace).deleteAll();
-      console.log('✅ Pinecone namespace deleted');
-    } catch (err) {
-      console.error('⚠️ Pinecone delete warning:', err.message);
-      // We continue even if Pinecone fails (it might already be empty)
+    try { await pineconeIndex.namespace(project.pineconeNamespace).deleteAll(); } catch (e) {}
+
+    if (project.fileKeys.length > 0) {
+      await supabase.storage.from('nexusmind-uploads').remove(project.fileKeys);
     }
 
-    // 3. Delete Files from Supabase (Clean the Vault)
-    if (project.fileKeys && project.fileKeys.length > 0) {
-      const { error } = await supabase.storage
-        .from('nexusmind-uploads')
-        .remove(project.fileKeys);
-      
-      if (error) console.error('⚠️ Supabase delete warning:', error.message);
-      else console.log('✅ Supabase files deleted');
-    }
-
-    // 4. Delete Record from MongoDB (Clean the Ledger)
     await Project.deleteOne({ _id: projectId });
-
-    res.json({ message: 'Project deleted successfully' });
-
+    res.json({ message: 'Project deleted' });
   } catch (error) {
-    console.error("Delete Error:", error);
     res.status(500).json({ message: error.message });
   }
 };
